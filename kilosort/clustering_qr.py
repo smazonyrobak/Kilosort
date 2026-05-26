@@ -11,7 +11,7 @@ from scipy.cluster.vq import kmeans
 import faiss
 from tqdm import tqdm 
 
-from kilosort import hierarchical, swarmsplitter
+from kilosort import hierarchical, swarmsplitter, state_compat
 from kilosort.utils import log_performance
 
 logger = logging.getLogger(__name__)
@@ -414,7 +414,8 @@ def get_nearest_centers(xy, xcent, ycent):
 
 
 def run(ops, st, tF, mode='template', device=torch.device('cuda'),
-        progress_bar=None, clear_cache=False, verbose=False):
+        progress_bar=None, clear_cache=False, verbose=False,
+        use_state_compat_graph_features=True):
 
     if mode == 'template':
         xy, iC = xy_templates(ops)
@@ -434,6 +435,25 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     ycent = y_centers(ops)
     xcent = x_centers(ops)
     nsp = st.shape[0]
+    scaled_graph_features = (
+        use_state_compat_graph_features
+        and state_compat.graph_features_enabled(ops)
+    )
+    if scaled_graph_features:
+        tF_graph, feature_scale, feature_meta = state_compat.make_graph_features(
+            tF, st, ops, mode
+        )
+        state_compat.store_graph_feature_metadata(
+            ops, mode, feature_scale, feature_meta, tF_graph
+        )
+        logger.info(
+            f'State compat graph features ({mode}): '
+            f'feature scale min/median/max: '
+            f'{feature_scale.min():.4g}/{np.median(feature_scale):.4g}/'
+            f'{feature_scale.max():.4g}'
+        )
+    else:
+        tF_graph = tF
     nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
     total_centers = np.unique(nearest_center).size
     
@@ -470,12 +490,19 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         v = True
 
                 Xd, igood, ichan = get_data_cpu(
-                    ops, xy, iC, iclust_template, tF, ycent[kk], xcent[jj],
+                    ops, xy, iC, iclust_template, tF_graph, ycent[kk], xcent[jj],
                     dmin=dmin, dminx=dminx, ix=ix,
                     )
                 if Xd is None:
                     nearby_chans_empty += 1
                     continue
+                if scaled_graph_features:
+                    Xd_template, _, _ = get_data_cpu(
+                        ops, xy, iC, iclust_template, tF, ycent[kk], xcent[jj],
+                        dmin=dmin, dminx=dminx, ix=ix,
+                        )
+                else:
+                    Xd_template = Xd
 
                 logger.debug(f'Center {ii} | Xd shape: {Xd.shape} | ntemp: {ntemp}')
                 if verbose and Xd.nelement() > 10**8:
@@ -523,7 +550,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                 # we need the new templates here         
                 W = torch.zeros((Nfilt, ops['Nchan'], ops['settings']['n_pcs']))
                 for j in range(Nfilt):
-                    w = Xd[iclust==j].mean(0)
+                    w = Xd_template[iclust==j].mean(0)
                     W[j, ichan, :] = torch.reshape(w, (-1, ops['settings']['n_pcs'])).cpu()
                 
                 Wall = torch.cat((Wall, W), 0)

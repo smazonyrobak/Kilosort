@@ -10,7 +10,8 @@ import torch
 
 import kilosort
 from kilosort import (preprocessing, datashift, template_matching, clustering_qr, 
-                      clustering_qr, io, spikedetect, CCG, PROBE_DIR)
+                      clustering_qr, io, spikedetect, CCG, PROBE_DIR,
+                      state_compat)
 from kilosort.parameters import DEFAULT_SETTINGS
 from kilosort.utils import (
     log_performance, log_cuda_details, probe_as_string, ops_as_string,
@@ -192,6 +193,7 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
                 verbose_log, save_extra_vars, file_object, progress_bar,
             )
 
+    ops = state_compat.strip_disabled_state_compat(ops)
     return ops, st, clu, tF, Wall, similar_templates, \
            is_ref, est_contam_rate, kept_spikes
 
@@ -261,7 +263,8 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             )
         
         # Pretty-print ops and probe for log
-        logger.debug(f"Initial ops:\n\n{ops_as_string(ops)}\n")
+        ops_for_log = state_compat.strip_disabled_state_compat(ops)
+        logger.debug(f"Initial ops:\n\n{ops_as_string(ops_for_log)}\n")
         logger.debug(f"Probe dictionary:\n\n{probe_as_string(ops['probe'])}\n")
 
         # Baseline performance metrics
@@ -359,7 +362,7 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
     finally:
         close_logger()
 
-
+    ops = state_compat.strip_disabled_state_compat(ops)
     return ops, st, clu, tF, Wall, similar_templates, \
            is_ref, est_contam_rate, kept_spikes
 
@@ -493,6 +496,11 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
         # Default used to be None, now it's a constant. Adding this so that
         # cached settings values in the GUI don't cause disruption.
         settings['max_channel_distance'] = DEFAULT_SETTINGS['max_channel_distance']
+    if settings['state_compat_enabled']:
+        settings['state_compat_use_local_templates'] = True
+        settings['state_compat_use_scaled_graph_features'] = True
+        settings['state_compat_compute_residual_energy'] = True
+        settings['state_compat_compute_unit_anisotropy'] = True
 
     if settings['nearest_chans'] > len(probe['chanMap']):
         msg = f"""
@@ -812,13 +820,77 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info(' ')
     logger.info('First clustering')
     logger.info('-'*40)
+    preserve_stock_parents = state_compat.local_templates_enabled(ops)
+    if preserve_stock_parents:
+        logger.info(
+            'State compat: first clustering uses raw features to preserve '
+            'stock parent templates'
+        )
     clu, Wall = clustering_qr.run(
         ops, st0, tF, mode='spikes', device=device, progress_bar=progress_bar,
-        clear_cache=clear_cache, verbose=verbose
+        clear_cache=clear_cache, verbose=verbose,
+        use_state_compat_graph_features=not preserve_stock_parents
         )
-    Wall3 = template_matching.postprocess_templates(
-        Wall, ops, clu, st0, tF, device=device
+    extract_kwargs = {}
+    if state_compat.local_templates_enabled(ops):
+        template_window_table, spike_to_template_window, _, _, _, _ = \
+            state_compat.make_snr_adaptive_template_windows(
+                st0, clu, tF, Wall, ops
+            )
+        Wall_extract, local_template_table, parent_id, window_id, start, end = \
+            state_compat.build_local_templates(
+                Wall, st0, clu, tF, template_window_table, ops
+            )
+        global_template_ids = np.full(Wall.shape[0], -1, dtype='int32')
+        global_mask = local_template_table['window_id'] == -1
+        global_template_ids[local_template_table['parent_id'][global_mask]] = \
+            local_template_table['local_template_id'][global_mask]
+        missing_local = spike_to_template_window < 0
+        spike_to_template_window[missing_local] = global_template_ids[
+            clu[missing_local]
+        ]
+        Wall3, kept_template_idx = template_matching.postprocess_templates(
+            Wall_extract, ops, spike_to_template_window, st0, tF, device=device,
+            template_parent_id=parent_id,
+            protect_same_parent_templates=state_compat.protect_same_parent_templates(ops),
+            return_kept_template_idx=True
+            )
+        local_template_table = local_template_table[kept_template_idx].copy()
+        local_template_table['local_template_id'] = np.arange(
+            local_template_table.size, dtype='int32'
         )
+        parent_id = parent_id[kept_template_idx]
+        window_id = window_id[kept_template_idx]
+        start = start[kept_template_idx]
+        end = end[kept_template_idx]
+        state_compat.store_template_metadata(
+            ops, local_template_table, parent_id, window_id, start, end
+        )
+        local_mask = window_id != -1
+        windows_per_parent = np.unique(parent_id[local_mask], return_counts=True)[1]
+        window_count_values, window_count_counts = np.unique(
+            windows_per_parent, return_counts=True
+        )
+        logger.info(
+            'State compat: '
+            f'{int(local_mask.sum())} local templates created across '
+            f'{len(windows_per_parent)} parents; windows-per-parent distribution: '
+            f'{dict(zip(window_count_values.tolist(), window_count_counts.tolist()))}; '
+            f'globals={int((window_id == -1).sum())}'
+        )
+        extract_kwargs = {
+            'local_template_parent_id': parent_id,
+            'local_template_window_id': window_id,
+            'local_template_valid_start_sample': start,
+            'local_template_valid_end_sample': end,
+            'local_template_edge_padding': state_compat.edge_padding_samples(ops),
+            'state_compat_compute_residual_energy':
+                ops['settings']['state_compat_compute_residual_energy'],
+        }
+    else:
+        Wall3 = template_matching.postprocess_templates(
+            Wall, ops, clu, st0, tF, device=device
+            )
 
     elapsed = time.time() - tic
     total = time.time() - tic0
@@ -840,7 +912,8 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info('Extracting spikes using cluster waveforms')
     logger.info('-'*40)
     st, tF, ops = template_matching.extract(
-        ops, bfile, Wall3, device=device, progress_bar=progress_bar
+        ops, bfile, Wall3, device=device, progress_bar=progress_bar,
+        **extract_kwargs
         )
    
     log_thread_count(logger)

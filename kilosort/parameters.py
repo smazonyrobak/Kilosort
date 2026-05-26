@@ -491,6 +491,156 @@ EXTRA_PARAMETERS = {
             after sorting is complete.
             """
     },
+
+    'state_compat_enabled': {
+        'gui_name': 'state compat enabled', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': False, 'step': 'clustering',
+        'description':
+            """
+            Master switch for state-compatible template matching modifications.
+            When False, the standard Kilosort4 path is used.
+            """
+    },
+
+    'state_compat_use_local_templates': {
+        'gui_name': 'state compat local templates', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': False, 'step': 'clustering',
+        'description':
+            """
+            Use SNR-adaptive time-local learned templates when
+            state_compat_enabled is True.
+            """
+    },
+
+    'state_compat_template_target_snr': {
+        'gui_name': 'state compat target snr', 'type': float, 'min': 0,
+        'max': np.inf, 'exclude': [0], 'default': 8.0, 'step': 'clustering',
+        'description':
+            """
+            Target template SNR used to set the number of spikes per
+            time-local template window.
+            """
+    },
+
+    'state_compat_min_spikes_per_template_window': {
+        'gui_name': 'state compat min spikes/window', 'type': int, 'min': 1,
+        'max': np.inf, 'exclude': [], 'default': 50, 'step': 'clustering',
+        'description':
+            """
+            Minimum number of spikes used to estimate a local template window.
+            """
+    },
+
+    'state_compat_max_spikes_per_template_window': {
+        'gui_name': 'state compat max spikes/window', 'type': int, 'min': 1,
+        'max': np.inf, 'exclude': [], 'default': 100000, 'step': 'clustering',
+        'description':
+            """
+            Maximum number of spikes used to estimate a local template window.
+            """
+    },
+
+    'state_compat_min_window_duration_s': {
+        'gui_name': 'state compat min window seconds', 'type': float, 'min': 0,
+        'max': np.inf, 'exclude': [], 'default': 60.0, 'step': 'clustering',
+        'description':
+            """
+            Minimum duration for a local template window.
+            """
+    },
+
+    'state_compat_max_window_duration_s': {
+        'gui_name': 'state compat max window seconds', 'type': float, 'min': 0,
+        'max': np.inf, 'exclude': [], 'default': 3600.0, 'step': 'clustering',
+        'description':
+            """
+            Maximum duration for a local template window.
+            """
+    },
+
+    'state_compat_max_windows_per_parent': {
+        'gui_name': 'state compat max windows/parent', 'type': int, 'min': 1,
+        'max': np.inf, 'exclude': [], 'default': 20, 'step': 'clustering',
+        'description':
+            """
+            Maximum number of local template windows allowed per parent cluster.
+            """
+    },
+
+    'state_compat_template_window_overlap_s': {
+        'gui_name': 'state compat window overlap seconds', 'type': float,
+        'min': 0, 'max': np.inf, 'exclude': [], 'default': 5.0,
+        'step': 'clustering',
+        'description':
+            """
+            Temporal edge padding used when matching time-local templates.
+            """
+    },
+
+    'state_compat_protect_same_parent_templates': {
+        'gui_name': 'state compat protect same-parent templates', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': True,
+        'step': 'clustering',
+        'description':
+            """
+            Prevent waveform-similarity deletion between local templates that
+            came from the same parent cluster.
+            """
+    },
+
+    'state_compat_compute_residual_energy': {
+        'gui_name': 'state compat residual energy', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': False,
+        'step': 'postprocessing',
+        'description':
+            """
+            Save residual-energy diagnostics for spikes detected with local
+            templates.
+            """
+    },
+
+    'state_compat_compute_unit_anisotropy': {
+        'gui_name': 'state compat unit anisotropy', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': False,
+        'step': 'postprocessing',
+        'description':
+            """
+            Save passive unit anisotropy descriptors after sorting.
+            """
+    },
+
+    'state_compat_use_scaled_graph_features': {
+        'gui_name': 'state compat scaled graph features', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': False,
+        'step': 'clustering',
+        'description':
+            """
+            Standardise per-dimension graph-clustering features when
+            state_compat_enabled is True.
+            """
+    },
+
+    'state_compat_feature_scale_alpha': {
+        'gui_name': 'state compat feature scale alpha', 'type': float,
+        'min': 0, 'max': np.inf, 'exclude': [], 'default': 0.01,
+        'step': 'clustering',
+        'description':
+            """
+            Multiplier for the median feature standard deviation used as the
+            regularisation floor during graph-feature scaling.
+            """
+    },
+
+    'state_compat_save_scaled_features': {
+        'gui_name': 'state compat save scaled features', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': True,
+        'step': 'clustering',
+        'description':
+            """
+            Store scaled graph features in ops['state_compat'] for
+            reproducibility when graph-feature scaling is active.
+            """
+    },
 }
 
 # Add default values to descriptions

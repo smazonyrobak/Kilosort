@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch.fft import fft, ifft, fftshift
 
-from kilosort import CCG
+from kilosort import CCG, state_compat
 from kilosort.preprocessing import get_drift_matrix, fft_highpass
 from kilosort.postprocessing import (
     remove_duplicates, compute_spike_positions, make_pc_features
@@ -370,6 +370,25 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # Save spike mask so that it can be applied to other variables if needed
     # when loading results.
     np.save((results_dir / 'kept_spikes.npy'), kept_spikes)
+    cluster_anisotropy = state_compat.save_state_compat_outputs(
+        results_dir, ops, clu, kept_spikes
+    )
+    match_counts = state_compat.global_local_match_counts(ops, kept_spikes)
+    if match_counts is not None:
+        global_count, local_count, total = match_counts
+        logger.info(
+            'State compat global-matched spikes: '
+            f'{global_count} / {total} = {100*global_count/max(total, 1):.2f}%; '
+            f'local-matched spikes: {local_count} / {total} = '
+            f'{100*local_count/max(total, 1):.2f}%'
+        )
+    if cluster_anisotropy is not None:
+        logger.info(
+            'State compat anisotropy min/median/max: '
+            f'{cluster_anisotropy.min():.4g}/'
+            f'{np.median(cluster_anisotropy):.4g}/'
+            f'{cluster_anisotropy.max():.4g}'
+        )
     log_performance(logger, level='debug', header='save_to_phy, remove duplicates',
                     reset=True)
 
@@ -478,6 +497,7 @@ def save_ops(ops, results_dir=None):
         results_dir = Path(results_dir)
     results_dir.mkdir(exist_ok=True)
 
+    ops = state_compat.strip_disabled_state_compat(ops)
     ops = ops.copy()
     # Convert paths to strings before saving, otherwise ops can only be loaded
     # on the system that originally ran the code (causes problems for tests).

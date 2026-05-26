@@ -5,7 +5,7 @@ import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
-from kilosort import CCG
+from kilosort import CCG, state_compat
 from kilosort.utils import log_performance
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,12 @@ def prepare_extract(xc, yc, U, nC, position_limit, device=torch.device('cuda')):
     return iCC, iCC_mask, iU, Ucc
 
 
-def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
+def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
+            local_template_parent_id=None, local_template_window_id=None,
+            local_template_valid_start_sample=None,
+            local_template_valid_end_sample=None,
+            local_template_edge_padding=0,
+            state_compat_compute_residual_energy=False):
     nC = ops['settings']['nearest_chans']
     position_limit = ops['settings']['position_limit']
     iCC, iCC_mask, iU, Ucc = prepare_extract(
@@ -68,6 +73,19 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     ctc = prepare_matching(ops, U)
     st = np.zeros((10**6, 3), 'float64')
     tF  = torch.zeros((10**6, nC , ops['settings']['n_pcs']))
+    local_templates_active = local_template_parent_id is not None
+    if local_templates_active:
+        local_template_parent_id = np.asarray(local_template_parent_id)
+        local_template_window_id = np.asarray(local_template_window_id)
+        local_template_valid_start_sample = np.asarray(local_template_valid_start_sample)
+        local_template_valid_end_sample = np.asarray(local_template_valid_end_sample)
+        spike_local_template_id = np.zeros(10**6, 'int32')
+        spike_parent_template_id = np.zeros(10**6, 'int32')
+        spike_template_window_id = np.zeros(10**6, 'int32')
+        spike_match_score = np.zeros(10**6, 'float32')
+        if state_compat_compute_residual_energy:
+            spike_residual_energy = np.zeros(10**6, 'float32')
+            spike_residual_energy_normed = np.zeros(10**6, 'float32')
     k = 0
     prog = tqdm(
         np.arange(bfile.n_batches, dtype=np.int64),
@@ -81,9 +99,28 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 log_performance(logger, 'debug', f'Batch {ibatch}')
 
             X = bfile.padded_batch_to_torch(ibatch, ops)
-            stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, device=device)
+            template_time_mask = None
+            if local_templates_active:
+                batch_start = int(ibatch) * bfile.batch_downsampling * ops['batch_size']
+                template_time_mask = state_compat.template_time_mask(
+                    local_template_valid_start_sample,
+                    local_template_valid_end_sample,
+                    batch_start,
+                    X.shape[-1],
+                    ops,
+                    local_template_edge_padding,
+                    device
+                )
+            stt, amps, th_amps, Xres = run_matching(
+                ops, X, U, ctc, device=device, template_time_mask=template_time_mask
+            )
             xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
             xfeat += amps * Ucc[:,stt[:,1]]
+            if local_templates_active and state_compat_compute_residual_energy:
+                residual_energy, residual_energy_normed = \
+                    state_compat.compute_residual_energy(
+                        Xres, U, ops['wPCA'], iCC, iU, Ucc, stt, amps, tiwave
+                    )
 
             if ibatch == 0:
                 # Can sometimes get negative spike times for first batch since
@@ -93,19 +130,57 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 xfeat = xfeat[:,~neg_spikes,:]
                 amps = amps[~neg_spikes,:]
                 th_amps = th_amps[~neg_spikes,:]
+                if local_templates_active and state_compat_compute_residual_energy:
+                    residual_energy = residual_energy[~neg_spikes]
+                    residual_energy_normed = residual_energy_normed[~neg_spikes]
 
             nsp = len(stt) 
             if k+nsp>st.shape[0]:                     
                 st = np.concatenate((st, np.zeros_like(st)), 0)
                 tF  = torch.cat((tF,  torch.zeros_like(tF)), 0)
+                if local_templates_active:
+                    spike_local_template_id = np.concatenate((
+                        spike_local_template_id,
+                        np.zeros_like(spike_local_template_id)
+                    ), 0)
+                    spike_parent_template_id = np.concatenate((
+                        spike_parent_template_id,
+                        np.zeros_like(spike_parent_template_id)
+                    ), 0)
+                    spike_template_window_id = np.concatenate((
+                        spike_template_window_id,
+                        np.zeros_like(spike_template_window_id)
+                    ), 0)
+                    spike_match_score = np.concatenate((
+                        spike_match_score, np.zeros_like(spike_match_score)
+                    ), 0)
+                    if state_compat_compute_residual_energy:
+                        spike_residual_energy = np.concatenate((
+                            spike_residual_energy,
+                            np.zeros_like(spike_residual_energy)
+                        ), 0)
+                        spike_residual_energy_normed = np.concatenate((
+                            spike_residual_energy_normed,
+                            np.zeros_like(spike_residual_energy_normed)
+                        ), 0)
 
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size'])
             stt = stt.double()
             st[k:k+nsp,0] = ((stt[:,0]-nt) + t_shift).cpu().numpy() - nt//2 + ops['nt0min']
             st[k:k+nsp,1] = stt[:,1].cpu().numpy()
             st[k:k+nsp,2] = th_amps.cpu().numpy().squeeze()
-            
+
             tF[k:k+nsp]  = xfeat.transpose(0,1).cpu()
+            if local_templates_active:
+                local_ids = stt[:,1].cpu().numpy().astype('int32')
+                spike_local_template_id[k:k+nsp] = local_ids
+                spike_parent_template_id[k:k+nsp] = local_template_parent_id[local_ids]
+                spike_template_window_id[k:k+nsp] = local_template_window_id[local_ids]
+                spike_match_score[k:k+nsp] = th_amps.cpu().numpy().squeeze()
+                if state_compat_compute_residual_energy:
+                    spike_residual_energy[k:k+nsp] = residual_energy.cpu().numpy()
+                    spike_residual_energy_normed[k:k+nsp] = \
+                        residual_energy_normed.cpu().numpy()
 
             k+= nsp
             
@@ -122,6 +197,19 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     isort = np.argsort(st[:k,0])
     st = st[isort]
     tF = tF[isort]
+    if local_templates_active:
+        kwargs = {}
+        if state_compat_compute_residual_energy:
+            kwargs['residual_energy'] = spike_residual_energy[:k][isort]
+            kwargs['residual_energy_normed'] = spike_residual_energy_normed[:k][isort]
+        state_compat.store_spike_metadata(
+            ops,
+            spike_local_template_id[:k][isort],
+            spike_parent_template_id[:k][isort],
+            spike_template_window_id[:k][isort],
+            spike_match_score[:k][isort],
+            **kwargs
+        )
 
     return st, tF, ops
 
@@ -141,14 +229,25 @@ def align_U(U, ops, device=torch.device('cuda')):
     return Unew, imax
 
 
-def postprocess_templates(Wall, ops, clu, st, tF, device=torch.device('cuda')):
+def postprocess_templates(Wall, ops, clu, st, tF, device=torch.device('cuda'),
+                          template_parent_id=None,
+                          protect_same_parent_templates=False,
+                          return_kept_template_idx=False):
     Wall2, _ = align_U(Wall, ops, device=device)
     #Wall3, _= remove_duplicates(ops, Wall2)
-    Wall3, _, _, _, _ = merging_function(
+    out = merging_function(
         ops, Wall2.transpose(1,2), clu, st, tF,
-        0.9, 'mu', check_dt=False, device=device
+        0.9, 'mu', check_dt=False, template_parent_id=template_parent_id,
+        protect_same_parent_templates=protect_same_parent_templates,
+        return_kept_template_idx=return_kept_template_idx, device=device
         )
+    if return_kept_template_idx:
+        Wall3, _, _, _, _, kept_template_idx = out
+    else:
+        Wall3, _, _, _, _ = out
     Wall3 = Wall3.transpose(1,2).to(device)
+    if return_kept_template_idx:
+        return Wall3, kept_template_idx
     return Wall3
 
 
@@ -167,7 +266,8 @@ def prepare_matching(ops, U):
     return ctc
 
 
-def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
+def run_matching(ops, X, U, ctc, device=torch.device('cuda'),
+                 template_time_mask=None):
     Th = ops['Th_learned']
     nt = ops['nt']
     max_peels = ops['max_peels']
@@ -201,6 +301,8 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
 
         Cf[:, :nt] = 0
         Cf[:, -nt:] = 0
+        if template_time_mask is not None:
+            Cf = Cf.masked_fill(~template_time_mask, 0)
 
         Cfmax, imax = torch.max(Cf, 0)
         Cmax  = max_pool1d(Cfmax.unsqueeze(0).unsqueeze(0), (2*nt+1), stride=1, padding=(nt))
@@ -244,13 +346,22 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     return  st, amps, th_amps, Xres
 
 
-def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=True,
+def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
+                     check_dt=True, template_parent_id=None,
+                     protect_same_parent_templates=False,
+                     return_kept_template_idx=False,
                      device=torch.device('cuda')):
     clu2 = clu.copy()
-    clu_unq, ns = np.unique(clu2, return_counts = True)
+    if template_parent_id is not None:
+        template_parent_id = np.asarray(template_parent_id)
 
     Ww = Wall.to(device)
     NN = len(Ww)
+    if template_parent_id is not None:
+        clu_unq = np.arange(NN, dtype=clu2.dtype)
+        ns = np.bincount(clu2[clu2 >= 0].astype('int64'), minlength=NN)
+    else:
+        clu_unq, ns = np.unique(clu2, return_counts = True)
 
     isort = np.argsort(ns)[::-1]
 
@@ -276,6 +387,10 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             #print(t, nmerge)
 
         kk = clu_unq[isort[t]]
+
+        if ns[kk] == 0:
+            t += 1
+            continue
 
         if (mode == 'ccg') and is_ref[kk]==0:
             t += 1
@@ -304,6 +419,12 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             jj = jsort[j]
             if cmax[jj] < r_thresh:
                 break
+            if (
+                protect_same_parent_templates
+                and template_parent_id is not None
+                and template_parent_id[kk] == template_parent_id[jj]
+            ):
+                continue
             # compare with CCG
             if mode == 'ccg':
                 st1 = st[:,0][clu2==jj] / ops['fs']
@@ -342,6 +463,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         # Otherwise, everything has been merged into a single cluster
         clu2 = imap[clu2]
 
+    kept_template_idx = np.nonzero(~is_merged)[0]
     Ww = Ww[~is_merged]
 
     if mode == 'ccg':
@@ -354,7 +476,10 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     clu2 = clu2[sorted_idx]
     tensor_idx = torch.from_numpy(sorted_idx)
     tF = tF[tensor_idx]
+    state_compat.sort_spike_metadata(ops, sorted_idx)
 
+    if return_kept_template_idx:
+        return Ww.cpu(), clu2, is_ref, st, tF, kept_template_idx
     return Ww.cpu(), clu2, is_ref, st, tF
 
 
